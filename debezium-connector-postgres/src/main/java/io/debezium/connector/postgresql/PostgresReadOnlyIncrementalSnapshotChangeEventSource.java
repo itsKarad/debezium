@@ -16,6 +16,8 @@ import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.notification.NotificationService;
+import io.debezium.pipeline.signal.SignalPayload;
+import io.debezium.pipeline.signal.actions.snapshotting.SnapshotConfiguration;
 import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotChangeEventSource;
 import io.debezium.pipeline.source.spi.DataChangeEventListener;
 import io.debezium.pipeline.source.spi.SnapshotProgressListener;
@@ -101,6 +103,41 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         return (PostgresReadOnlyIncrementalSnapshotContext<TableId>) context;
     }
 
+    /*
+     * Kafka signals run on the SignalProcessor thread, while replication events run on the streaming thread.
+     * Both paths use the same snapshot context and window, so serialize their operations on this source.
+     */
+    @Override
+    public synchronized void init(P partition, OffsetContext offsetContext) {
+        super.init(partition, offsetContext);
+    }
+
+    @Override
+    public synchronized void addDataCollectionNamesToSnapshot(SignalPayload<P> signalPayload, SnapshotConfiguration snapshotConfiguration)
+            throws InterruptedException {
+        super.addDataCollectionNamesToSnapshot(signalPayload, snapshotConfiguration);
+    }
+
+    @Override
+    public synchronized void closeWindow(P partition, String id, OffsetContext offsetContext) throws InterruptedException {
+        super.closeWindow(partition, id, offsetContext);
+    }
+
+    @Override
+    public synchronized void pauseSnapshot(P partition, OffsetContext offsetContext) {
+        super.pauseSnapshot(partition, offsetContext);
+    }
+
+    @Override
+    public synchronized void resumeSnapshot(P partition, OffsetContext offsetContext) throws InterruptedException {
+        super.resumeSnapshot(partition, offsetContext);
+    }
+
+    @Override
+    public synchronized void processSchemaChange(P partition, OffsetContext offsetContext, DataCollectionId dataCollectionId) throws InterruptedException {
+        super.processSchemaChange(partition, offsetContext, dataCollectionId);
+    }
+
     @Override
     protected void emitWindowOpen(P partition, OffsetContext offsetContext) {
 
@@ -114,7 +151,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     }
 
     @Override
-    public void processMessage(P partition, DataCollectionId dataCollectionId, Object key, OffsetContext offsetContext) throws InterruptedException {
+    public synchronized void processMessage(P partition, DataCollectionId dataCollectionId, Object key, OffsetContext offsetContext) throws InterruptedException {
 
         if (getContext() == null) {
             LOGGER.warn("Context is null, skipping message processing");
@@ -136,7 +173,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     }
 
     @Override
-    public void processTransactionCommittedEvent(P partition, OffsetContext offsetContext) throws InterruptedException {
+    public synchronized void processTransactionCommittedEvent(P partition, OffsetContext offsetContext) throws InterruptedException {
 
         if (getContext() == null) {
             LOGGER.warn("Context is null, skipping message processing");
@@ -149,7 +186,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     }
 
     @Override
-    public void processHeartbeat(P partition, OffsetContext offsetContext) throws InterruptedException {
+    public synchronized void processHeartbeat(P partition, OffsetContext offsetContext) throws InterruptedException {
 
         if (getContext() == null) {
             LOGGER.warn("Context is null, skipping message processing");
