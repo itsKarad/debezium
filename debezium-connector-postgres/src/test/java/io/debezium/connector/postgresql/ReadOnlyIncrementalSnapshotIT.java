@@ -9,6 +9,10 @@ import static io.debezium.junit.EqualityCheck.LESS_THAN;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.entry;
 
+import java.io.ByteArrayInputStream;
+import java.io.ObjectInputStream;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -18,11 +22,15 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.kafka.connect.data.Struct;
+import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 
 import io.debezium.config.CommonConnectorConfig;
 import io.debezium.config.Configuration;
+import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIsNot;
+import io.debezium.connector.postgresql.junit.SkipWhenDecoderPluginNameIsNot.DecoderPluginName;
 import io.debezium.doc.FixFor;
+import io.debezium.heartbeat.DatabaseHeartbeatImpl;
 import io.debezium.heartbeat.Heartbeat;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.junit.SkipWhenDatabaseVersion;
@@ -32,8 +40,12 @@ import io.debezium.pipeline.signal.actions.snapshotting.ExecuteSnapshot;
 import io.debezium.pipeline.signal.actions.snapshotting.StopSnapshot;
 import io.debezium.pipeline.signal.channels.KafkaSignalChannel;
 import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotChangeEventSource;
+import io.debezium.pipeline.source.snapshot.incremental.AbstractIncrementalSnapshotContext;
 import io.debezium.relational.RelationalDatabaseConnectorConfig;
+import io.debezium.util.HexConverter;
 import io.debezium.util.Strings;
+
+import ch.qos.logback.classic.Level;
 
 @SkipWhenDatabaseVersion(check = LESS_THAN, major = 13, minor = 0, reason = "Function pg_current_snapshot() not supported until PostgreSQL 13")
 public class ReadOnlyIncrementalSnapshotIT extends IncrementalSnapshotIT {
@@ -279,6 +291,93 @@ public class ReadOnlyIncrementalSnapshotIT extends IncrementalSnapshotIT {
 
         assertThat(logInterceptor.countOccurrences("Skipping read chunk because snapshot is not running")).isEqualTo(0L);
 
+    }
+
+    @Test
+    @FixFor("debezium/dbz#3147")
+    @SkipWhenDecoderPluginNameIsNot(value = DecoderPluginName.PGOUTPUT, reason = "Logical decoding messages are only supported by the PGOUTPUT decoder")
+    @SkipWhenDatabaseVersion(check = LESS_THAN, major = 14, reason = "PGOUTPUT logical messages are supported starting with PostgreSQL 14")
+    public void restartAdvancesSnapshotAfterUnpublishedTransactionsAndHeartbeat() throws Exception {
+        TestHelper.execute("CREATE TABLE s2.elsewhere (pk integer PRIMARY KEY)");
+        try (JdbcConnection connection = databaseConnection()) {
+            connection.setAutoCommit(false);
+            for (int i = 1; i <= 20; i++) {
+                connection.executeWithoutCommitting(String.format("INSERT INTO s1.a (pk, aa) VALUES (%s, %s)", i, i));
+            }
+            connection.commit();
+        }
+
+        final Function<Configuration.Builder, Configuration.Builder> connectorConfig = builder -> builder
+                .with(PostgresConnectorConfig.INCREMENTAL_SNAPSHOT_CHUNK_SIZE, 10)
+                .with(PostgresConnectorConfig.PUBLICATION_AUTOCREATE_MODE, PostgresConnectorConfig.AutoCreateMode.FILTERED.getValue())
+                .with(Heartbeat.HEARTBEAT_INTERVAL_PROPERTY_NAME, 10_000)
+                .with(DatabaseHeartbeatImpl.HEARTBEAT_ACTION_QUERY, "SELECT pg_logical_emit_message(true, 'heartbeat', '')");
+
+        try (LogInterceptor snapshotInterceptor = new LogInterceptor(PostgresReadOnlyIncrementalSnapshotContext.class)) {
+            snapshotInterceptor.setLoggerLevel(PostgresReadOnlyIncrementalSnapshotContext.class, Level.TRACE);
+            final Configuration firstRunConfig = connectorConfig.apply(config())
+                    .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 1)
+                    .build();
+            start(connectorClass(), firstRunConfig,
+                    record -> topicName().equals(record.topic()) && ((Struct) record.key()).getInt32("pk") == 11);
+            waitForConnectorToStart();
+            sendAdHocSnapshotSignal("s1.a");
+            Awaitility.await().atMost(10, TimeUnit.SECONDS)
+                    .until(() -> snapshotInterceptor.containsMessage("Setting high watermark to"));
+
+            try (JdbcConnection connection = databaseConnection()) {
+                connection.execute("INSERT INTO s1.a (pk, aa) VALUES (100, 100)");
+            }
+
+            final List<Integer> firstRunKeys = new ArrayList<>();
+            final var firstRunRecords = consumeRecordsByTopicUntil((count, record) -> {
+                if (topicName().equals(record.topic())) {
+                    firstRunKeys.add(((Struct) record.key()).getInt32("pk"));
+                }
+                return firstRunKeys.size() >= 11;
+            }, Duration.ofSeconds(20));
+            final var firstRunTableRecords = firstRunRecords.recordsForTopic(topicName());
+            assertThat(firstRunTableRecords).isNotNull();
+            assertThat(firstRunKeys).containsExactlyInAnyOrder(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 100);
+
+            stopConnector();
+            final Map<String, Object> committedOffset = readLastCommittedOffset(connectorConfig.apply(config()).build(), firstRunTableRecords.get(0).sourcePartition());
+            assertThat(deserializeOffsetArray(committedOffset, AbstractIncrementalSnapshotContext.EVENT_PRIMARY_KEY)).containsExactly((Object) 10);
+
+            try (LogInterceptor restartInterceptor = new LogInterceptor(AbstractIncrementalSnapshotChangeEventSource.class);
+                    LogInterceptor walSearchInterceptor = new LogInterceptor(PostgresStreamingChangeEventSource.class)) {
+                startConnector(connectorConfig);
+                Awaitility.await().atMost(10, TimeUnit.SECONDS)
+                        .until(() -> restartInterceptor.containsMessage("loading of initial chunk completed"));
+                Awaitility.await().atMost(10, TimeUnit.SECONDS)
+                        .until(() -> walSearchInterceptor.containsMessage("Searching for WAL resume position"));
+
+                try (JdbcConnection connection = databaseConnection()) {
+                    connection.setAutoCommit(false);
+                    for (int i = 1; i <= 100; i++) {
+                        connection.executeWithoutCommitting(String.format("INSERT INTO s2.elsewhere (pk) VALUES (%s)", i));
+                        connection.commit();
+                    }
+                }
+
+                final List<Integer> resumedKeys = new ArrayList<>();
+                consumeRecordsByTopicUntil((count, record) -> {
+                    if (topicName().equals(record.topic())) {
+                        resumedKeys.add(((Struct) record.key()).getInt32("pk"));
+                    }
+                    return resumedKeys.size() >= 10;
+                }, Duration.ofSeconds(30));
+
+                assertThat(resumedKeys).containsExactlyInAnyOrder(11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
+                assertThat(resumedKeys).doesNotHaveDuplicates();
+            }
+        }
+    }
+
+    private Object[] deserializeOffsetArray(Map<String, Object> offset, String key) throws Exception {
+        try (ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(HexConverter.convertFromHex((String) offset.get(key))))) {
+            return (Object[]) input.readObject();
+        }
     }
 
     @Override

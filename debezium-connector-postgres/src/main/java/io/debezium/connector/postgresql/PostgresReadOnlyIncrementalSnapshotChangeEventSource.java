@@ -6,12 +6,12 @@
 package io.debezium.connector.postgresql;
 
 import java.sql.SQLException;
-import java.util.function.Consumer;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.debezium.DebeziumException;
+import io.debezium.connector.postgresql.connection.Lsn;
 import io.debezium.connector.postgresql.connection.PostgresConnection;
 import io.debezium.jdbc.JdbcConnection;
 import io.debezium.pipeline.EventDispatcher;
@@ -56,8 +56,8 @@ import io.debezium.util.Clock;
  * <br/>
  * <br/>
  * <b>No binlog events</b>
- * <p>Heartbeat events (events that are sent when there are not changes from the WAL) are used to update the window processing mode when the rate of WAL updates is low.</p>
- * <p>The heartbeat has the same txId as the latest WAL event at the moment and it will used to continue to read chunks even there are not event coming from the WAL. This processing will end if the watermarks changes because that means there are some transaction potentially modifying data.</p>
+ * <p>Heartbeat events (events that are sent when there are no changes from the WAL) are used to update the window processing mode when the rate of WAL updates is low.</p>
+ * <p>When the high watermark has no in-progress transactions, the snapshot can advance after the committed stream LSN passes the WAL position captured after that watermark. Existing transaction visibility checks handle transactions that were already in progress.</p>
  * <br/>
  * <b>No changes between watermarks</b>
  * <p>A window can be opened and closed right away by the same event. This can happen when a high watermark and low watermark are the same, which means there were no active transaction during the chunk select. Chunk will get inserted right after the low watermark, no events will be deduplicated from the chunk</p>
@@ -72,6 +72,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
 
     private static final String FORCE_NEW_TRANSACTION = "SELECT (CASE pg_is_in_recovery() WHEN 't' THEN NULL::xid8 ELSE pg_current_xact_id() END) AS txid;";
     private static final String CURRENT_SNAPSHOT = "SELECT * FROM pg_current_snapshot();";
+    private static final String CURRENT_WAL_POSITION = "SELECT CASE pg_is_in_recovery() WHEN 't' THEN pg_last_wal_receive_lsn() ELSE pg_current_wal_lsn() END;";
 
     private final PostgresConnection jdbcConnection;
     private final PostgresSchema schema;
@@ -104,13 +105,22 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     @Override
     protected void emitWindowOpen(P partition, OffsetContext offsetContext) {
 
-        getCurrentSnapshot(getContext()::setLowWatermark);
+        getContext().setLowWatermark(getCurrentSnapshot());
     }
 
     @Override
     protected void emitWindowClose(P partition, OffsetContext offsetContext) {
 
-        getCurrentSnapshot(getContext()::setHighWatermark);
+        final PgSnapshot highWatermark = getCurrentSnapshot();
+        try {
+            // Capture a WAL barrier after the snapshot. A committed stream LSN beyond this
+            // point proves that changes visible to the high watermark have reached the stream.
+            final Lsn walPosition = highWatermark.getXip().isEmpty() ? getCurrentWalPosition() : null;
+            getContext().setHighWatermark(highWatermark, walPosition);
+        }
+        catch (SQLException e) {
+            throw new DebeziumException(e);
+        }
     }
 
     @Override
@@ -171,12 +181,22 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
     private void readUntilNewTransactionChange(P partition, OffsetContext offsetContext) throws InterruptedException {
 
         Long eventTxId = offsetContext.getSourceInfo().getInt64(SourceInfo.TXID_KEY);
+        Lsn lastCommitLsn = ((PostgresOffsetContext) offsetContext).lastCommitLsn();
 
         LOGGER.debug("Event txId {}, snapshot is running {}, reachedHighWatermark {}",
                 eventTxId, getContext().snapshotRunning(), getContext().isTransactionVisible(eventTxId));
 
         LOGGER.trace("Incremental snapshot context {}", getContext());
         if (getContext().snapshotRunning() && maxInProgressTransactionCommitted(eventTxId)) {
+            getContext().closeWindow();
+            sendWindowEvents(partition, offsetContext);
+            readChunk(partition, offsetContext);
+
+            return;
+        }
+
+        if (getContext().snapshotRunning() && getContext().canAdvanceWindow(lastCommitLsn)) {
+            LOGGER.debug("Committed stream LSN {} has passed the high watermark; advancing the read-only incremental snapshot", lastCommitLsn);
             getContext().closeWindow();
             sendWindowEvents(partition, offsetContext);
             readChunk(partition, offsetContext);
@@ -202,23 +222,28 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         }
     }
 
-    private void getCurrentSnapshot(Consumer<PgSnapshot> watermark) {
+    private PgSnapshot getCurrentSnapshot() {
 
         try {
 
-            PgSnapshot pgSnapshot = jdbcConnection.queryAndMap(CURRENT_SNAPSHOT, jdbcConnection.singleResultMapper(rs -> {
+            return jdbcConnection.queryAndMap(CURRENT_SNAPSHOT, jdbcConnection.singleResultMapper(rs -> {
 
                 String currentSnapshot = rs.getString(1);
                 LOGGER.trace("Current snapshot {}", currentSnapshot);
 
                 return PgSnapshot.valueOf(currentSnapshot);
             }, "Unable to get current snapshot"));
-
-            watermark.accept(pgSnapshot);
         }
         catch (SQLException e) {
             throw new DebeziumException(e);
         }
+    }
+
+    private Lsn getCurrentWalPosition() throws SQLException {
+        return jdbcConnection.queryAndMap(CURRENT_WAL_POSITION, jdbcConnection.singleResultMapper(rs -> {
+            String currentWalPosition = rs.getString(1);
+            return currentWalPosition == null ? null : Lsn.valueOf(currentWalPosition);
+        }, "Unable to get current WAL position"));
     }
 
     private boolean maxInProgressTransactionCommitted(Long eventTxId) {
