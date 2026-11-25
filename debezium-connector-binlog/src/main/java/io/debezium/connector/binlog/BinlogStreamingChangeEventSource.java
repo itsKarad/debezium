@@ -1466,12 +1466,16 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
                 client.disconnect();
                 client.setBinlogFilename(position.getFilename());
                 client.setBinlogPosition(position.getPosition());
+                setBinlogReplayInProgress(true);
                 client.connect();
             }
         }
         catch (IOException e) {
             LOGGER.error("Unexpected error when re-connecting to the MySQL binary log reader", e);
         }
+    }
+
+    protected void setBinlogReplayInProgress(boolean replaying) {
     }
 
     BinlogPosition getCurrentBinlogPosition() {

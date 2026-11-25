@@ -240,7 +240,7 @@ public class MariaDbConnectorTask extends BinlogSourceTask<MariaDbPartition, Mar
                 connectorConfig.getServiceRegistry().tryGetService(DebeziumHeaderProducer.class));
 
         // Create the binary log client that will be used for streaming change events
-        final BinaryLogClient binaryLogClient = new BinaryLogClient(
+        final BinaryLogClient binaryLogClient = new MariaDbBinaryLogClient(
                 connectorConfig.getHostName(),
                 connectorConfig.getPort(),
                 connectorConfig.getUserName(),

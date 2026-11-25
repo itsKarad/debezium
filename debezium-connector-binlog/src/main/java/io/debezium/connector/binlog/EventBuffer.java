@@ -135,6 +135,7 @@ public class EventBuffer<T extends BinlogStreamingChangeEventSource<P, O>, P ext
         if (forwardTillPosition != null) {
             if (forwardTillPosition.equals(streamingChangeEventSource.getCurrentBinlogPosition())) {
                 forwardTillPosition = null;
+                streamingChangeEventSource.setBinlogReplayInProgress(false);
             }
             return true;
         }
@@ -235,16 +236,20 @@ public class EventBuffer<T extends BinlogStreamingChangeEventSource<P, O>, P ext
         for (Event e : buffer) {
             streamingChangeEventSource.handleEvent(partition, offsetContext, changeEventSourceContext, e);
         }
-        LOGGER.debug("Executing events from binlog that have not fit into buffer");
-        if (isInBufferFullMode()) {
+        final BinlogPosition rewindPosition = largeTxNotBufferedPosition;
+        if (rewindPosition != null) {
             forwardTillPosition = streamingChangeEventSource.getCurrentBinlogPosition();
-            streamingChangeEventSource.rewindBinaryLogClient(changeEventSourceContext, largeTxNotBufferedPosition);
         }
         streamingChangeEventSource.getMetrics().onCommittedTransaction();
         if (!wellFormed) {
             streamingChangeEventSource.getMetrics().onNotWellFormedTransaction();
         }
         clear();
+        if (rewindPosition != null) {
+            // The reconnected reader can deliver events before this callback returns.
+            LOGGER.debug("Executing events from binlog that have not fit into buffer");
+            streamingChangeEventSource.rewindBinaryLogClient(changeEventSourceContext, rewindPosition);
+        }
     }
 
     /**

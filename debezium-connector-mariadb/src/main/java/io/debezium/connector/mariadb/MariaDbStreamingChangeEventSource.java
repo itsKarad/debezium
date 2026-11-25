@@ -81,6 +81,11 @@ public class MariaDbStreamingChangeEventSource extends BinlogStreamingChangeEven
     }
 
     @Override
+    protected void setBinlogReplayInProgress(boolean replaying) {
+        getBinaryLogClient().setUseBinlogFilenamePositionInGtidMode(replaying);
+    }
+
+    @Override
     protected void setEventTimestamp(Event event, long eventTs) {
         eventTimestamp = Instant.ofEpochMilli(eventTs);
     }
