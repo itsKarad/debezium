@@ -176,7 +176,7 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
                 eventTxId, getContext().snapshotRunning(), getContext().isTransactionVisible(eventTxId));
 
         LOGGER.trace("Incremental snapshot context {}", getContext());
-        if (getContext().snapshotRunning() && maxInProgressTransactionCommitted(eventTxId)) {
+        if (getContext().snapshotRunning() && getContext().maxInProgressTransactionCommitted(eventTxId)) {
             getContext().closeWindow();
             sendWindowEvents(partition, offsetContext);
             readChunk(partition, offsetContext);
@@ -219,15 +219,6 @@ public class PostgresReadOnlyIncrementalSnapshotChangeEventSource<P extends Post
         catch (SQLException e) {
             throw new DebeziumException(e);
         }
-    }
-
-    private boolean maxInProgressTransactionCommitted(Long eventTxId) {
-
-        if (getContext().getHighWatermark() == null) {
-            return false;
-        }
-
-        return getContext().getHighWatermark().getXMax().equals(eventTxId);
     }
 
     private void forceNewTransactionId() {

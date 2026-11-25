@@ -24,6 +24,9 @@ public class PgSnapshot {
     private static final String SNAPSHOT_FORMAT = "(\\d+):(\\d+):((\\d+,*)+)*";
     private static final Pattern SNAPSHOT_PATTERN = Pattern.compile(SNAPSHOT_FORMAT);
     private static final String SEPARATOR = ",";
+    private static final long XID_MASK = 0xffff_ffffL;
+    private static final long XID_HALF_RANGE = 0x8000_0000L;
+    private static final long XID_MODULO = 0x1_0000_0000L;
 
     private final Long xMin;
     private final Long xMax;
@@ -45,6 +48,22 @@ public class PgSnapshot {
 
     public Set<Long> getXip() {
         return xip;
+    }
+
+    /**
+     * Expands a 32-bit transaction ID from the replication stream to the 64-bit transaction ID used by this snapshot.
+     * The snapshot's xmin provides the epoch anchor, and the signed modular difference selects the nearest epoch.
+     * PostgreSQL keeps the active transaction ID range within half of the 32-bit xid space.
+     *
+     * @param transactionId 32-bit transaction ID from the replication stream
+     * @return the full transaction ID in the epoch nearest to this snapshot's xmin
+     */
+    long getFullTransactionId(long transactionId) {
+        long difference = ((transactionId & XID_MASK) - (xMin & XID_MASK)) & XID_MASK;
+        if (difference >= XID_HALF_RANGE) {
+            difference -= XID_MODULO;
+        }
+        return xMin + difference;
     }
 
     /**

@@ -69,18 +69,21 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
         LOGGER.trace("Received event with TxId {}", eventTxId);
         LOGGER.trace("Updating window. Window opened: {}, low watermark {}, high watermark {}", windowOpened, lowWatermark, highWatermark);
 
-        if (!windowOpened && lowWatermark != null) {
-            boolean pastLowWatermark = eventTxId >= lowWatermark.getXMin();
-            if (pastLowWatermark) {
-                LOGGER.debug("Current event txId {}, low watermark {}", eventTxId, lowWatermark);
-                windowOpened = true;
+        if (lowWatermark != null) {
+            final long fullEventTxId = lowWatermark.getFullTransactionId(eventTxId);
+            if (!windowOpened) {
+                boolean pastLowWatermark = fullEventTxId >= lowWatermark.getXMin();
+                if (pastLowWatermark) {
+                    LOGGER.debug("Current event txId {}, low watermark {}", eventTxId, lowWatermark);
+                    windowOpened = true;
+                }
             }
-        }
-        if (windowOpened && highWatermark != null) {
-            boolean pastHighWatermark = eventTxId > Math.max(highWatermark.getXMax(), lowWatermark.getXMax());
-            if (pastHighWatermark) {
-                LOGGER.debug("Current event txId {}, high watermark {}", eventTxId, highWatermark);
-                closeWindow();
+            if (windowOpened && highWatermark != null) {
+                boolean pastHighWatermark = fullEventTxId > Math.max(highWatermark.getXMax(), lowWatermark.getXMax());
+                if (pastHighWatermark) {
+                    LOGGER.debug("Current event txId {}, high watermark {}", eventTxId, highWatermark);
+                    closeWindow();
+                }
             }
         }
     }
@@ -103,7 +106,16 @@ public class PostgresReadOnlyIncrementalSnapshotContext<T> extends AbstractIncre
         if (highWatermark == null) {
             return false;
         }
-        return eventTxId.compareTo(highWatermark.getXMin()) <= 0;
+        return highWatermark.getFullTransactionId(eventTxId) <= highWatermark.getXMin();
+    }
+
+    boolean maxInProgressTransactionCommitted(Long eventTxId) {
+
+        if (highWatermark == null) {
+            return false;
+        }
+
+        return highWatermark.getFullTransactionId(eventTxId) == highWatermark.getXMax();
     }
 
     public boolean watermarksChanged() {
