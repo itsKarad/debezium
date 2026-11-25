@@ -61,6 +61,7 @@ import io.debezium.connector.oracle.jdbc.OracleDatabaseSettings;
 import io.debezium.connector.oracle.jdbc.StandardOracleConnectionFactory;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
+import io.debezium.connector.oracle.logminer.RetriableLogMinerException;
 import io.debezium.connector.oracle.logminer.buffered.BufferedLogMinerStreamingChangeEventSource.ProcessResult;
 import io.debezium.connector.oracle.logminer.events.EventType;
 import io.debezium.connector.oracle.logminer.events.LogMinerEvent;
@@ -1482,6 +1483,37 @@ public abstract class AbstractBufferedLogMinerStreamingChangeEventSourceTest ext
 
             Mockito.verify(offsetContext).setScn(Scn.valueOf(250));
             Mockito.verify(offsetContext, Mockito.never()).setScn(Scn.valueOf(100));
+        }
+    }
+
+    @Test
+    @FixFor("debezium/dbz#3177")
+    void shouldRetryOnceWhenRedoLogBecomesUnavailableBeforeReadingRows() throws Exception {
+        try (var source = getChangeEventSource(getConfig().build())) {
+            final var miningSource = spyWithMinedRows(source);
+            final PreparedStatement statement = miningSource.createQueryStatement();
+            final ResultSet emptyResult = statement.executeQuery();
+
+            final SQLException unavailable = new SQLException("ORA-00310: archived log contains the wrong sequence", "72000", 310);
+            Mockito.doThrow(unavailable, unavailable)
+                    .doReturn(emptyResult)
+                    .doThrow(unavailable)
+                    .when(statement).executeQuery();
+
+            final Scn start = Scn.valueOf(240);
+            final Scn end = Scn.valueOf(300);
+
+            assertThatThrownBy(() -> miningSource.process(start, end))
+                    .isInstanceOf(RetriableLogMinerException.class)
+                    .hasCause(unavailable);
+            assertThatThrownBy(() -> miningSource.process(start, end)).isSameAs(unavailable);
+            Mockito.verify(offsetContext, Mockito.never()).setScn(Mockito.any());
+
+            miningSource.process(start, end);
+
+            assertThatThrownBy(() -> miningSource.process(start, end))
+                    .isInstanceOf(RetriableLogMinerException.class)
+                    .hasCause(unavailable);
         }
     }
 

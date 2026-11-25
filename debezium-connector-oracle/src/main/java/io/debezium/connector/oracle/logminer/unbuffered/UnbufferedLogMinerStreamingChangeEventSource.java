@@ -30,6 +30,7 @@ import io.debezium.connector.oracle.jdbc.OracleConnectionFactory;
 import io.debezium.connector.oracle.logminer.AbstractLogMinerStreamingChangeEventSource;
 import io.debezium.connector.oracle.logminer.LogMinerChangeRecordEmitter;
 import io.debezium.connector.oracle.logminer.LogMinerStreamingChangeEventSourceMetrics;
+import io.debezium.connector.oracle.logminer.RetriableLogMinerException;
 import io.debezium.connector.oracle.logminer.StatementGroupCommitConsumer;
 import io.debezium.connector.oracle.logminer.events.DmlEvent;
 import io.debezium.connector.oracle.logminer.events.EventType;
@@ -103,6 +104,7 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
         int miningStartAttempts = 1;
 
         boolean needsNewSession = true; // first session always starts a new session
+        boolean queryNeedsNewSession = false;
         boolean dictionaryWritten = false; // tracks if data dictionary is written to logs
         boolean sessionActive = false;
         boolean needsConnectionRestart = false;
@@ -129,10 +131,11 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
             if (sessionActive && !needsNewSession) {
                 boolean timeout = isMiningSessionRestartRequired(watch);
                 boolean logSwitch = !timeout && checkLogSwitchOccurredAndUpdate();
-                if (timeout || logSwitch) {
+                if (timeout || logSwitch || queryNeedsNewSession) {
                     endMiningSession();
                     sessionActive = false;
                     needsNewSession = true;
+                    queryNeedsNewSession = false;
                     dictionaryWritten = false;
                     needsConnectionRestart = getConfig().isLogMiningRestartConnection();
                     watch = Stopwatch.accumulating().start();
@@ -175,9 +178,13 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
 
             if (startMiningSession(minLogScn, Scn.NULL, miningStartAttempts)) {
                 miningStartAttempts = 1;
-                minCommitScn = process(minCommitScn, upperBoundsScn);
-
-                getMetrics().setLastBatchProcessingDuration(Duration.between(batchStartTime, Instant.now()));
+                try {
+                    minCommitScn = process(minCommitScn, upperBoundsScn);
+                    getMetrics().setLastBatchProcessingDuration(Duration.between(batchStartTime, Instant.now()));
+                }
+                catch (RetriableLogMinerException e) {
+                    queryNeedsNewSession = true;
+                }
             }
             else {
                 miningStartAttempts++;

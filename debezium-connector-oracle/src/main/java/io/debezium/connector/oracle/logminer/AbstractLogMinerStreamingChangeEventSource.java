@@ -138,6 +138,7 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
     private final OffsetActivityMonitorService offsetActivityMonitorService;
 
     private boolean sequenceUnavailable = false;
+    private boolean querySequenceUnavailable;
     private List<LogFile> currentLogFiles;
     private List<LogFile> sessionLogFiles;
     private RedoThreadState currentRedoThreadState;
@@ -493,7 +494,7 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
      */
     protected void executeAndProcessQuery(PreparedStatement statement) throws SQLException, InterruptedException {
         final Instant queryStartTime = Instant.now();
-        try (ResultSet resultSet = statement.executeQuery()) {
+        try (ResultSet resultSet = openMiningQuery(statement)) {
             getMetrics().setLastDurationOfFetchQuery(Duration.between(queryStartTime, Instant.now()));
 
             final Instant startProcessTime = Instant.now();
@@ -518,6 +519,26 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
                     getMetrics().getLagFromSourceInMilliseconds(),
                     getMetrics().getNumberOfActiveTransactions(),
                     getOffsetContext());
+        }
+    }
+
+    private ResultSet openMiningQuery(PreparedStatement statement) throws SQLException {
+        try {
+            final ResultSet resultSet = statement.executeQuery();
+            querySequenceUnavailable = false;
+            return resultSet;
+        }
+        catch (SQLException e) {
+            if (querySequenceUnavailable || (e.getErrorCode() != 310
+                    && (e.getMessage() == null || !e.getMessage().startsWith("ORA-00310")))) {
+                throw e;
+            }
+
+            // The query has not returned a cursor, so the batch can be retried at the same position.
+            // Allow one session rebuild before sending a persistent error to the task error handler.
+            querySequenceUnavailable = true;
+            LOGGER.warn("Restarting mining session because a redo log became unavailable while opening the query.");
+            throw new RetriableLogMinerException(e);
         }
     }
 
