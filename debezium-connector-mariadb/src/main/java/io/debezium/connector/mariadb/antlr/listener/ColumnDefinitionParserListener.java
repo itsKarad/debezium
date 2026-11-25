@@ -152,6 +152,12 @@ public class ColumnDefinitionParserListener extends MariaDBParserBaseListener {
     }
 
     @Override
+    public void enterGeneratedColumnConstraint(MariaDBParser.GeneratedColumnConstraintContext ctx) {
+        columnEditor.generated(true);
+        super.enterGeneratedColumnConstraint(ctx);
+    }
+
+    @Override
     public void enterSerialDefaultColumnConstraint(MariaDBParser.SerialDefaultColumnConstraintContext ctx) {
         serialColumn();
         super.enterSerialDefaultColumnConstraint(ctx);

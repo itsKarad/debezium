@@ -205,6 +205,18 @@ public class MariaDbOnlyAntlrDdlParserTest {
     }
 
     @Test
+    @FixFor("debezium/dbz#2910")
+    public void shouldMarkVirtualAndPersistentColumnsAsGenerated() {
+        parser.parse("CREATE DATABASE db1;", tables);
+        parser.parse("CREATE TABLE db1.generated_columns (id INT PRIMARY KEY, a INT, " +
+                "v INT AS (a + 1) VIRTUAL, b INT, s INT AS (b + 2) PERSISTENT);", tables);
+
+        final Table table = tables.forTable(new TableId("db1", null, "generated_columns"));
+        assertThat(table.columnWithName("v").isGenerated()).isTrue();
+        assertThat(table.columnWithName("s").isGenerated()).isTrue();
+    }
+
+    @Test
     @FixFor("DBZ-4661")
     public void shouldSupportCreateTableWithEncryption() {
         parser.parse(

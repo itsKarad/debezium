@@ -96,6 +96,7 @@ import io.debezium.pipeline.EventDispatcher;
 import io.debezium.pipeline.monitor.OffsetActivityMonitor;
 import io.debezium.pipeline.monitor.OffsetActivityMonitorService;
 import io.debezium.pipeline.source.spi.StreamingChangeEventSource;
+import io.debezium.relational.Column;
 import io.debezium.relational.Table;
 import io.debezium.relational.TableId;
 import io.debezium.schema.SchemaChangeEvent;
@@ -1317,11 +1318,11 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
     }
 
     /**
-     * Expands a row image that omits columns, e.g. when the database runs with
-     * {@code binlog_row_image=NOBLOB}, to the full table width using the event's included-columns
-     * bitmap. Missing BLOB/TEXT columns are filled with the configured unavailable-value
-     * placeholder so that downstream consumers receive a consistent record shape; other missing
-     * columns are left null. Rows that already match the table width are returned unchanged.
+     * Expands a row image that omits columns, e.g. generated columns or BLOB/TEXT columns when the
+     * database runs with {@code binlog_row_image=NOBLOB}, to the full table width using the event's
+     * included-columns bitmap. The NOBLOB path retains its configured placeholder behavior. The
+     * generated-column path only aligns an image when every omitted column is generated and not
+     * auto-incremented. Rows that already match the table width are returned unchanged.
      *
      * @param table the table the row belongs to; may be null
      * @param includedColumns the bitmap of columns present in the row image; may be null
@@ -1329,20 +1330,51 @@ public abstract class BinlogStreamingChangeEventSource<P extends BinlogPartition
      * @return the row expanded to the full table width, or the original row if no expansion applies
      */
     private Serializable[] alignRowToTable(Table table, BitSet includedColumns, Serializable[] row) {
-        if (!isBinlogRowImageNoblob || table == null || row == null || includedColumns == null || row.length >= table.columns().size()) {
+        if (isBinlogRowImageNoblob && table != null && row != null && includedColumns != null && row.length < table.columns().size()) {
+            final Serializable[] aligned = new Serializable[table.columns().size()];
+            int sourceIndex = 0;
+            for (int i = 0; i < aligned.length; i++) {
+                if (includedColumns.get(i) && sourceIndex < row.length) {
+                    aligned[i] = row[sourceIndex++];
+                }
+                else if (RowImageUtils.isBlobOrTextColumn(table.columns().get(i))) {
+                    aligned[i] = BinlogValueConverters.UNAVAILABLE_VALUE;
+                }
+            }
+            return aligned;
+        }
+        if (!alignRowsWithOmittedGeneratedColumns() || table == null || row == null || includedColumns == null || row.length >= table.columns().size()) {
             return row;
         }
-        final Serializable[] aligned = new Serializable[table.columns().size()];
+        final int columnCount = table.columns().size();
+        if (includedColumns.cardinality() != row.length || includedColumns.length() > columnCount) {
+            return row;
+        }
+        for (int i = 0; i < columnCount; i++) {
+            if (!includedColumns.get(i)) {
+                final Column column = table.columns().get(i);
+                if (!column.isGenerated() || column.isAutoIncremented()) {
+                    return row;
+                }
+            }
+        }
+        final Serializable[] aligned = new Serializable[columnCount];
         int sourceIndex = 0;
         for (int i = 0; i < aligned.length; i++) {
-            if (includedColumns.get(i) && sourceIndex < row.length) {
+            if (includedColumns.get(i)) {
                 aligned[i] = row[sourceIndex++];
-            }
-            else if (RowImageUtils.isBlobOrTextColumn(table.columns().get(i))) {
-                aligned[i] = BinlogValueConverters.UNAVAILABLE_VALUE;
             }
         }
         return aligned;
+    }
+
+    /**
+     * Whether the connector's database can omit generated columns from row images.
+     *
+     * @return true when generated-column omissions can be aligned from the event bitmap
+     */
+    protected boolean alignRowsWithOmittedGeneratedColumns() {
+        return false;
     }
 
     private void validateChangeEventWithTable(Table table, Object[] before, Object[] after) {

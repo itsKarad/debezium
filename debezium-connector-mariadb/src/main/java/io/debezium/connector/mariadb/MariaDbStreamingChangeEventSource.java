@@ -76,6 +76,11 @@ public class MariaDbStreamingChangeEventSource extends BinlogStreamingChangeEven
     }
 
     @Override
+    protected boolean alignRowsWithOmittedGeneratedColumns() {
+        return true;
+    }
+
+    @Override
     protected void configureReplicaCompatibility(BinaryLogClient client) {
         client.setMariaDbSlaveCapability(4);
     }
