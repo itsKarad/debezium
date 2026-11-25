@@ -140,6 +140,8 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
         Throwable exceptionWhileSnapshot = null;
         try {
 
+            boolean snapshotOffsetDetermined = false;
+
             Set<Pattern> dataCollectionsToBeSnapshotted = getDataCollectionPattern(snapshottingTask.getDataCollections());
 
             Map<DataCollectionId, String> snapshotSelectOverridesByTable = snapshottingTask.getFilterQueries();
@@ -154,6 +156,13 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
 
             connection = createSnapshotConnection();
             connectionCreated(ctx);
+
+            if (!snapshottingTask.isOnDemand() && shouldDetermineSnapshotOffsetBeforeTableDiscovery()) {
+                // Capture the source position before metadata reads or pooled connections can pin RR read views.
+                LOGGER.info("Determining snapshot offset before table discovery");
+                determineSnapshotOffset(ctx, previousOffset);
+                snapshotOffsetDetermined = true;
+            }
 
             LOGGER.info("Snapshot step 2 - Determining captured tables");
 
@@ -173,8 +182,13 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
             // In case of a bocking snapshot the offsets of snapshot context must be the set to avoid reinitialization
             // to an empty one during the determineSnapshotOffset function
             if (!snapshottingTask.isOnDemand()) {
-                LOGGER.info("Snapshot step 4 - Determining snapshot offset");
-                determineSnapshotOffset(ctx, previousOffset);
+                if (snapshotOffsetDetermined) {
+                    LOGGER.info("Snapshot step 4 - Snapshot offset already determined");
+                }
+                else {
+                    LOGGER.info("Snapshot step 4 - Determining snapshot offset");
+                    determineSnapshotOffset(ctx, previousOffset);
+                }
             }
             else {
                 LOGGER.info("Snapshot step 4 - Determining snapshot offset (SKIPPED)");
@@ -437,6 +451,14 @@ public abstract class RelationalSnapshotChangeEventSource<P extends Partition, O
      */
     protected abstract void determineSnapshotOffset(RelationalSnapshotContext<P, O> snapshotContext, O previousOffset)
             throws Exception;
+
+    /**
+     * Whether the source position must be recorded before table discovery can run queries that establish a
+     * transaction's repeatable-read view.
+     */
+    protected boolean shouldDetermineSnapshotOffsetBeforeTableDiscovery() {
+        return false;
+    }
 
     /**
      * Reads the structure of all the captured tables, writing it to {@link RelationalSnapshotContext#tables}.

@@ -134,6 +134,11 @@ public abstract class BinlogSnapshotChangeEventSource<P extends BinlogPartition,
     }
 
     @Override
+    protected boolean shouldDetermineSnapshotOffsetBeforeTableDiscovery() {
+        return !connectorConfig.getSnapshotLockingStrategy().isLockingEnabled();
+    }
+
+    @Override
     protected void lockTablesForSchemaSnapshot(ChangeEventSourceContext sourceContext,
                                                RelationalSnapshotContext<P, O> snapshotContext)
             throws SQLException {
