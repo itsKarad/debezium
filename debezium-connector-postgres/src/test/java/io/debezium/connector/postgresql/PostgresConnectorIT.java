@@ -20,7 +20,10 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 import java.io.IOException;
 import java.io.StringReader;
+import java.sql.Connection;
+import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -4459,6 +4462,120 @@ public class PostgresConnectorIT extends AbstractAsyncEngineConnectorTest {
         assertThat(recordsAfterRestart.allRecordsInOrder()).hasSize(1);
         final Struct value = (Struct) recordsAfterRestart.allRecordsInOrder().get(0).value();
         assertThat(value.getStruct("after").getInt32("pk")).isEqualTo(3);
+    }
+
+    @Test
+    @FixFor("debezium/dbz#3101")
+    @SkipWhenDecoderPluginNameIsNot(value = SkipWhenDecoderPluginNameIsNot.DecoderPluginName.PGOUTPUT, reason = "The test advances a pgoutput replication slot to a row LSN")
+    void shouldReplayTransactionChangesWhenRestartingFromBeginOffsetAfterSlotAdvance() throws Exception {
+        final String table = "public.begin_offset_restart";
+        final String dataTopic = topicName(table);
+        final String slot = ReplicationConnection.Builder.DEFAULT_SLOT_NAME;
+        final String publication = ReplicationConnection.Builder.DEFAULT_PUBLICATION_NAME;
+        TestHelper.execute("DROP TABLE IF EXISTS " + table + ";");
+        TestHelper.execute("CREATE TABLE " + table + " (id text PRIMARY KEY)");
+
+        final Configuration config = TestHelper.defaultConfig()
+                .with(PostgresConnectorConfig.PLUGIN_NAME, "pgoutput")
+                .with(PostgresConnectorConfig.SNAPSHOT_MODE, SnapshotMode.NO_DATA)
+                .with(PostgresConnectorConfig.DROP_SLOT_ON_STOP, Boolean.FALSE)
+                .with(PostgresConnectorConfig.TABLE_INCLUDE_LIST, table)
+                .with(PostgresConnectorConfig.PROVIDE_TRANSACTION_METADATA, Boolean.TRUE)
+                .with(PostgresConnectorConfig.LSN_FLUSH_MODE, "connector_and_driver")
+                .with(PostgresConnectorConfig.OFFSET_SLOT_MISMATCH_STRATEGY, "trust_slot")
+                .with(PostgresConnectorConfig.MAX_BATCH_SIZE, 1)
+                .with(PostgresConnectorConfig.MAX_RETRIES, 0)
+                .build();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+        waitForStreamingRunning();
+        TestHelper.execute("INSERT INTO " + table + " VALUES ('r0')");
+
+        final List<SourceRecord> initialRecords = new ArrayList<>();
+        consumeRecords(3, initialRecords::add);
+        final SourceRecord initialChange = initialRecords.stream()
+                .filter(record -> dataTopic.equals(record.topic()))
+                .findFirst()
+                .orElseThrow();
+        stopConnector();
+
+        Awaitility.await().atMost(10, TimeUnit.SECONDS).pollInterval(100, TimeUnit.MILLISECONDS)
+                .until(() -> !TestHelper.getDefaultReplicationSlot().slotIsActive());
+
+        final long transactionId;
+        try (PostgresConnection connection = TestHelper.create()) {
+            connection.setAutoCommit(false);
+            try (Connection jdbcConnection = connection.connection(); Statement statement = jdbcConnection.createStatement()) {
+                statement.execute("INSERT INTO " + table + " VALUES ('r1')");
+                statement.execute("INSERT INTO " + table + " VALUES ('r2')");
+                try (ResultSet result = statement.executeQuery("SELECT txid_current()")) {
+                    result.next();
+                    transactionId = result.getLong(1);
+                }
+                jdbcConnection.commit();
+            }
+        }
+
+        final String secondChangeLsn;
+        try (PostgresConnection connection = TestHelper.create(); Statement statement = connection.connection().createStatement()) {
+            final String changesInSlot = "pg_logical_slot_peek_binary_changes('" + slot
+                    + "', NULL, NULL, 'proto_version', '1', 'publication_names', '" + publication + "')";
+            try (ResultSet result = statement.executeQuery("SELECT lsn::text FROM " + changesInSlot
+                    + " WHERE xid = " + transactionId + " AND get_byte(data, 0) = ascii('I') ORDER BY lsn OFFSET 1 LIMIT 1")) {
+                assertThat(result.next()).isTrue();
+                secondChangeLsn = result.getString(1);
+            }
+        }
+        TestHelper.execute("SELECT pg_replication_slot_advance('" + slot + "', '" + secondChangeLsn + "')");
+
+        final CountDownLatch stoppedAfterFirstChange = new CountDownLatch(1);
+        final AtomicReference<Throwable> stopError = new AtomicReference<>();
+        start(PostgresConnector.class, config, (success, message, error) -> {
+            stopError.set(error);
+            stoppedAfterFirstChange.countDown();
+        }, record -> dataTopic.equals(record.topic())
+                && "r1".equals(((Struct) record.value()).getStruct("after").getString("id")));
+
+        assertThat(stoppedAfterFirstChange.await(TestHelper.waitTimeForRecords() * 5L, TimeUnit.SECONDS)).isTrue();
+        assertThat(stopError.get()).isNotNull();
+        assertConnectorNotRunning();
+
+        final Map<String, Object> beginOffset = readLastCommittedOffset(config, initialChange.sourcePartition());
+        assertThat(beginOffset).containsEntry(SourceInfo.MSG_TYPE_KEY, "BEGIN");
+        assertThat(((Number) beginOffset.get(SourceInfo.TXID_KEY)).longValue()).isEqualTo(transactionId);
+        final long beginLsn = ((Number) beginOffset.get(SourceInfo.LSN_KEY)).longValue();
+        final long lastCompletelyProcessedLsn = ((Number) beginOffset
+                .get(PostgresOffsetContext.LAST_COMPLETELY_PROCESSED_LSN_KEY)).longValue();
+        assertThat(lastCompletelyProcessedLsn).isLessThan(beginLsn);
+        consumeAvailableRecords(record -> {
+        });
+        stopConnector();
+
+        start(PostgresConnector.class, config);
+        assertConnectorIsRunning();
+
+        final List<String> changes = new ArrayList<>();
+        final AtomicReference<Struct> end = new AtomicReference<>();
+        consumeRecordsUntil((count, record) -> {
+            if (dataTopic.equals(record.topic())) {
+                changes.add(((Struct) record.value()).getStruct("after").getString("id"));
+            }
+            else if (topicName("transaction").equals(record.topic())) {
+                final Struct value = (Struct) record.value();
+                if ("END".equals(value.getString("status")) && value.getString("id").startsWith(transactionId + ":")) {
+                    end.set(value);
+                }
+            }
+            return end.get() != null;
+        }, (count, record) -> "Waiting for the end of transaction " + transactionId,
+                waitTimeForRecordsAfterNulls(), record -> {
+                }, true);
+
+        assertThat(changes).containsExactly("r1", "r2");
+        assertThat(end.get()).isNotNull();
+        assertThat(end.get().getInt64("event_count")).isEqualTo(2L);
+        stopConnector();
     }
 
     /**

@@ -198,7 +198,10 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 connection.commit();
             }
 
-            this.lastCompletelyProcessedLsn = replicationStream.get().startLsn();
+            // The slot can start ahead of the saved boundary; don't mark that later position as processed.
+            this.lastCompletelyProcessedLsn = this.effectiveOffset.hasCompletelyProcessedPosition()
+                    ? this.effectiveOffset.lastCompletelyProcessedLsn()
+                    : replicationStream.get().startLsn();
 
             if (walPosition.searchingEnabled() && this.effectiveOffset.hasCompletelyProcessedPosition()) {
                 searchWalPosition(context, partition, this.effectiveOffset, stream, walPosition);
