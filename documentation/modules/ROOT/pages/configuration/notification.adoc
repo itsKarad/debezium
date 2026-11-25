@@ -98,7 +98,8 @@ The following example shows a typical notification that provides the status of a
 The following list describes select fields in the preceding initial snapshot notification example:
 
 `type`::
-The `type` field can contain one of the following values:
+The `type` field identifies the notification.
+For a terminal initial snapshot notification, it can contain one of the following values:
 
 * `COMPLETED`
 * `ABORTED`
@@ -123,6 +124,20 @@ a|[source, json]
       "timestamp": "1695817046353"
 }
 ----
+|Data collections resolved
+a|[source, json]
+----
+{
+   "id":"bc9e0e5f-56f8-4e1a-a482-28ab38750a2a",
+   "aggregate_type":"Initial Snapshot",
+   "type":"DATA_COLLECTIONS_RESOLVED",
+   "additional_data":{
+      "connector_name":"my-connector",
+      "data_collections":"table1, table2"
+   },
+   "timestamp":"1695817046353"
+}
+----
 |IN_PROGRESS
 a|[source, json]
 ----
@@ -139,6 +154,44 @@ a|[source, json]
 }
 ----
 The field `data_collection` is not supported for the MongoDB connector.
+
+|Chunk in progress
+a|[source, json]
+----
+{
+   "id":"d02047d6-377f-4a21-a4e9-cb6e817cf744",
+   "aggregate_type":"Initial Snapshot",
+   "type":"TABLE_CHUNK_IN_PROGRESS",
+   "additional_data":{
+      "connector_name":"my-connector",
+      "current_collection_in_progress":"table1",
+      "chunk_index":"5",
+      "total_chunks":"10",
+      "total_rows_scanned":"50"
+   },
+   "timestamp":"1695817046353"
+}
+----
+|Chunk completed
+a|[source, json]
+----
+{
+   "id":"6d82a3ec-ba86-4b36-9168-7423b0dd5c1d",
+   "aggregate_type":"Initial Snapshot",
+   "type":"TABLE_CHUNK_COMPLETED",
+   "additional_data":{
+      "connector_name":"my-connector",
+      "scanned_collection":"table1",
+      "data_collections":"table1, table2",
+      "chunk_index":"5",
+      "total_chunks":"10",
+      "status":"SUCCEEDED"
+   },
+   "timestamp":"1695817046353"
+}
+----
+The `TABLE_CHUNK_IN_PROGRESS` notification reports the current chunk and the number of rows scanned so far.
+The `TABLE_CHUNK_COMPLETED` notification reports a successfully completed chunk.
 
 |TABLE_SCAN_COMPLETED
 a|[source, json]
@@ -226,6 +279,20 @@ a|[source, json]
          "data_collections":"table1, table2"
       },
       "timestamp": "1695817046353"
+}
+----
+|Data collections resolved
+a|[source, json]
+----
+{
+   "id":"bc9e0e5f-56f8-4e1a-a482-28ab38750a2a",
+   "aggregate_type":"Incremental Snapshot",
+   "type":"DATA_COLLECTIONS_RESOLVED",
+   "additional_data":{
+      "connector_name":"my-connector",
+      "data_collections":"table1, table2"
+   },
+   "timestamp":"1695817046353"
 }
 ----
 |Paused
